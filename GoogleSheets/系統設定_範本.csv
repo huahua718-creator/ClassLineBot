@@ -1,0 +1,8 @@
+﻿設定項目,設定值,說明
+LINE_ACCESS_TOKEN,YOUR_LINE_ACCESS_TOKEN,貼上 LINE Channel Access Token
+ADMIN_USER_ID,YOUR_ADMIN_LINE_USER_ID,貼上 老師個人的 LINE User ID
+GEMINI_API_KEY,YOUR_GEMINI_API_KEY,貼上 Gemini API 金鑰
+TEACHER_EMAIL,primary,教師個人日曆（填寫 primary 即可自動寫入您目前這個 Google 帳號的主日曆）
+SCHOOL_CALENDAR_ID,clshlib7@gmail.com,填入 學校 Google 日曆 ID
+SCHOOL_ANNOUNCEMENT_URL,https://www.clsh.ntpc.edu.tw/p/403-1000-13-1.php,填入 學校公告網頁 URL
+CLASS_NAME,國二愛,填入班級名稱
