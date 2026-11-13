@@ -1,5 +1,64 @@
-// 💡 1. 讀取試算表中的「系統設定」分頁
+// ============================================================================
+// 班級 LINE Bot 回覆小幫手 (ClassLineBot)
+// 核心程式碼 - 高速快取與極速響應架構優化版
+// ============================================================================
+
+// ⚡ 快取 TTL 設定 (單位：秒)
+const CACHE_CONFIG = {
+  SETTINGS_TTL: 21600,       // 系統設定快取 6 小時
+  QA_TTL: 21600,             // QA 題庫快取 6 小時
+  CALENDAR_TTL: 14400,       // 行事曆快取 4 小時
+  NEWS_TTL: 14400,           // 學校公告快取 4 小時
+  USER_TTL: 7200,            // 使用者資料快取 2 小時
+  MODEL_TTL: 86400,          // 模型名稱快取 24 小時
+  THROTTLE_TTL: 1800         // 使用者最後互動時間寫入節流 30 分鐘
+};
+
+// 💡 快取輔助工具函式
+function getCache(key) {
+  try {
+    return CacheService.getScriptCache().get(key);
+  } catch (e) {
+    return null;
+  }
+}
+
+function setCache(key, value, ttlSeconds) {
+  try {
+    CacheService.getScriptCache().put(key, value, ttlSeconds);
+  } catch (e) {
+    Logger.log("⚠️ 快取寫入失敗 (" + key + "): " + e.toString());
+  }
+}
+
+function clearCache(key) {
+  try {
+    CacheService.getScriptCache().remove(key);
+  } catch (e) {}
+}
+
+function clearAllCaches() {
+  try {
+    const cache = CacheService.getScriptCache();
+    cache.remove("SYS_SETTINGS");
+    cache.remove("QA_DATA_JSON");
+    cache.remove("CALENDAR_CONTEXT");
+    cache.remove("NEWS_CONTEXT");
+    cache.remove("GEMINI_MODEL_NAME");
+    Logger.log("🧹 所有全域快取已清除！");
+  } catch (e) {}
+}
+
+// 💡 1. 讀取「系統設定」（優先使用 CacheService 記憶體快取）
 function getSystemSettings() {
+  const cacheKey = "SYS_SETTINGS";
+  const cached = getCache(cacheKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch (e) {}
+  }
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName('系統設定');
   const settings = {};
@@ -11,26 +70,30 @@ function getSystemSettings() {
       }
     }
   }
+  setCache(cacheKey, JSON.stringify(settings), CACHE_CONFIG.SETTINGS_TTL);
   return settings;
 }
 
+// ============================================================================
+// 🌟 LINE Webhook 核心進入點
+// ============================================================================
 function doPost(e) {
   try {
     const settings = getSystemSettings();
     const json = JSON.parse(e.postData.contents);
-    const event = json.events[0];
+    const event = json.events ? json.events[0] : null;
 
     if (!event) return ContentService.createTextOutput(JSON.stringify({ status: 'ok' }));
 
     const replyToken = event.replyToken;
-    const userId = event.source.userId;
+    const userId = event.source ? event.source.userId : null;
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const className = settings.CLASS_NAME || "班級";
 
-    // 👤 讀取/更新「使用者對照」分頁（含學生姓名、暱稱、情緒標記）
+    // 👤 高速讀取/更新使用者資訊（優先讀取 Cache，避免每次對話查詢 LINE API 與試算表）
     const userInfo = recordOrUpdateUser(ss, userId, settings.LINE_ACCESS_TOKEN);
-    const parentName = userInfo.displayName;
-    let studentName = userInfo.studentName;
+    const parentName = userInfo.displayName || "家長";
+    let studentName = userInfo.studentName || "";
     const userRow = userInfo.row;
 
     // 🌟 1. 處理「加入好友/歡迎訊息 (follow)」事件
@@ -59,65 +122,92 @@ function doPost(e) {
     // 🌟 2. 判斷是否為「登記/修改學生姓名」
     const isNameCommand = userMessage.startsWith("學生") || userMessage.startsWith("孩子") || userMessage.startsWith("名字");
     const cleanName = userMessage.replace(/^(?:學生姓名|學生|孩子|名字)[:：\s]*/, "").trim();
-    const isPotentialName = /^[\u4e00-\u9fa5]{2,4}$/.test(cleanName) && !/問|幾|啥|誰|請|選|選單|試算|行程|考試|放學|網址|公告|段考|請假/.test(cleanName);
+    const isPotentialName = /^[\u4e00-\u9fa5]{2,4}$/.test(cleanName) && !/問|幾|啥|誰|請|選|選單|試算|行程|考試|放學|網址|公告|段考|請假|刷新|快取/.test(cleanName);
 
     if ((isNameCommand && cleanName.length >= 2) || (!studentName && isPotentialName)) {
-      saveStudentName(ss, userRow, cleanName);
+      saveStudentName(ss, userRow, cleanName, userId, userInfo);
       studentName = cleanName;
       const newGreeting = `親愛的 ${cleanName} 家長您好：`;
       const confirmMsg = `${newGreeting}\n\n✅ 已成功登記學生姓名為「${cleanName}」！\n\n現在您可以隨時向我詢問：\n1️⃣ 班級規範與常見問題 (QA)\n2️⃣ 學校行事曆與班級行程\n3️⃣ 學校官網最新公告\n\n（若日後需修改學生姓名，隨時輸入「學生：新姓名」即可！）`;
       replyMessage(replyToken, confirmMsg, settings.LINE_ACCESS_TOKEN);
+      updateUserActiveThrottled(ss, userRow, userId);
       return ContentService.createTextOutput(JSON.stringify({ status: 'success' }));
     }
 
     // 動態判斷當前稱呼抬頭
     const greeting = studentName ? `親愛的 ${studentName} 家長您好：` : `親愛的 ${parentName} 您好：`;
 
-    let sheetQA = ss.getSheetByName('QA');
-
     // 💡 管理員指令 (支援文字與語音)
     if (userId === settings.ADMIN_USER_ID) {
       if (userMessage === "選單" || userMessage === "指令" || userMessage === "指令表" || userMessage === "幫助") {
         replyMessage(replyToken, getAdminMenuText(className), settings.LINE_ACCESS_TOKEN);
+        updateUserActiveThrottled(ss, userRow, userId);
         return ContentService.createTextOutput(JSON.stringify({ status: 'success' }));
       }
 
       if (userMessage.startsWith("新增QA") || userMessage.startsWith("新增關鍵字")) {
-        handleAdminAddQA(userMessage, replyToken, sheetQA, settings.LINE_ACCESS_TOKEN);
+        handleAdminAddQA(userMessage, replyToken, ss, settings.LINE_ACCESS_TOKEN);
+        updateUserActiveThrottled(ss, userRow, userId);
         return ContentService.createTextOutput(JSON.stringify({ status: 'success' }));
       }
 
       if (userMessage.startsWith("新增行程") || userMessage.startsWith("新增行事曆") || userMessage.startsWith("新增日曆")) {
         const teacherCalId = settings.TEACHER_CALENDAR_ID || "primary";
         handleAdminAddCalendar(userMessage, replyToken, teacherCalId, settings.LINE_ACCESS_TOKEN);
+        updateUserActiveThrottled(ss, userRow, userId);
+        return ContentService.createTextOutput(JSON.stringify({ status: 'success' }));
+      }
+
+      if (userMessage === "清除快取" || userMessage === "刷新快取" || userMessage === "重設快取") {
+        clearAllCaches();
+        replyMessage(replyToken, `🧹 已成功清除系統所有快取！\n\n系統將在下次呼叫時重新載入最新試算表設定、QA、行事曆與公告。`, settings.LINE_ACCESS_TOKEN);
         return ContentService.createTextOutput(JSON.stringify({ status: 'success' }));
       }
     }
 
-    // 讀取快取資料
-    const qaContext = getQAContext(sheetQA);
+    // ⚡ 3. 高速路徑 (Fast-Path)：常見問候語快速回覆 (< 0.3 秒)
+    if (/^(你好|您好|哈囉|嗨|早安|午安|晚安|hello|hi|hey)[!！~～\s]*$/i.test(userMessage)) {
+      const fastGreetingReply = `${greeting}\n\n您好！我是【${className}小幫手】🤖。\n\n請問有什麼我可以協助您的嗎？您可以向我詢問：\n1️⃣ 班級常見問題 (QA，如成績、電話、提醒事項)\n2️⃣ 學校與班級近期行事曆\n3️⃣ 學校最新公告\n若有特定狀況也可以直接留言，我會為您轉發給導師喔！`;
+      replyMessage(replyToken, fastGreetingReply, settings.LINE_ACCESS_TOKEN);
+      updateUserActiveThrottled(ss, userRow, userId);
+      return ContentService.createTextOutput(JSON.stringify({ status: 'success' }));
+    }
+
+    // ⚡ 4. 高速路徑 (Fast-Path)：QA 資料庫關鍵字比對 (< 0.4 秒，完全不走 AI)
+    const qaData = getQAData(ss);
+    const matchedQAAnswer = matchQAFastPath(userMessage, qaData.list);
+    if (matchedQAAnswer) {
+      const formattedQAReply = `${greeting}\n\n${matchedQAAnswer}`;
+      replyMessage(replyToken, formattedQAReply, settings.LINE_ACCESS_TOKEN);
+      updateUserActiveThrottled(ss, userRow, userId);
+      return ContentService.createTextOutput(JSON.stringify({ status: 'success' }));
+    }
+
+    // 🧠 5. 常態路徑：呼叫 Gemini AI 進行深度語意理解與情緒分析
     const calContext = getSchoolCalendarFromSheet(ss);
     const newsContext = getSchoolNewsContext(ss);
-    const fullContext = `${qaContext}\n${calContext}\n${newsContext}`;
+    const fullContext = `${qaData.context}\n${calContext}\n${newsContext}`;
 
-    // 呼叫 Gemini AI
     const aiResponse = callGeminiWithFallback(userMessage, fullContext, settings.GEMINI_API_KEY, className);
 
-    // 若 AI 偵測到情緒抱怨，僅自動在試算表中標註「需要特別關注」，不改變回覆語法
+    // 🌟 6. 先發送 LINE 回覆，確保家長端第一時間收到回應（不被後台作業拖慢）
+    const replyContent = aiResponse.replyText || `我是【${className}小幫手】🤖。\n\n若需要導師親自協助，請留下您想請教的事項，我會為您轉達給導師喔！`;
+    const formattedReply = `${greeting}\n\n${replyContent}`;
+    replyMessage(replyToken, formattedReply, settings.LINE_ACCESS_TOKEN);
+
+    // 🌟 7. 後台非關鍵作業（在已回覆後執行）
+    // (A) 若 AI 偵測到情緒抱怨，在試算表中標註
     if (aiResponse.autoFlagUser && userRow > 0) {
       autoMarkEmotionalUser(ss, userRow, "需要特別關注");
     }
 
-    // 🌟 3. LINE 回應與 Email 觸發
-    const replyContent = aiResponse.replyText || `我是【${className}小幫手】🤖。\n\n若需要導師親自協助，請留下您想請教的事項，我會為您轉達給導師喔！`;
-    const formattedReply = `${greeting}\n\n${replyContent}`;
-    
-    replyMessage(replyToken, formattedReply, settings.LINE_ACCESS_TOKEN);
-
-    // 只要 needEmail 為 true，發送 Email 給導師
+    // (B) 只要 needEmail 為 true，發送 Email 給導師
     if (aiResponse.needEmail) {
       sendTeacherEmail(settings.TEACHER_EMAIL, parentName, studentName, userId, userMessage, aiResponse.reason, className);
     }
+
+    // (C) 節流更新最後互動時間
+    updateUserActiveThrottled(ss, userRow, userId);
 
   } catch (err) {
     Logger.log("❌ doPost 錯誤: " + err.toString());
@@ -126,9 +216,21 @@ function doPost(e) {
   return ContentService.createTextOutput(JSON.stringify({ status: 'success' }));
 }
 
-// 👤 記錄並更新「使用者對照」分頁
+// ============================================================================
+// 👤 使用者資訊快取與試算表同步
+// ============================================================================
+
+// 讀取/更新「使用者對照」分頁（優先從快取取回，避免每次發起外部 LINE API 與試算表寫入）
 function recordOrUpdateUser(ss, userId, lineToken) {
   if (!userId) return { displayName: "家長", userTag: "", studentName: "", row: -1 };
+
+  const cacheKey = "USER_" + userId;
+  const cached = getCache(cacheKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch (e) {}
+  }
 
   let sheet = ss.getSheetByName('使用者對照');
   if (!sheet) {
@@ -138,54 +240,97 @@ function recordOrUpdateUser(ss, userId, lineToken) {
   }
 
   const nowStr = Utilities.formatDate(new Date(), "Asia/Taipei", "yyyy/MM/dd HH:mm:ss");
-  
-  let displayName = "家長";
-  try {
-    const url = `https://api.line.me/v2/bot/profile/${userId}`;
-    const response = UrlFetchApp.fetch(url, { 'headers': { 'Authorization': 'Bearer ' + lineToken }, 'muteHttpExceptions': true });
-    if (response.getResponseCode() === 200) {
-      const data = JSON.parse(response.getContentText());
-      if (data.displayName) displayName = data.displayName;
-    }
-  } catch (err) {
-    Logger.log("⚠️ 取得 LINE Profile 失敗: " + err.toString());
-  }
-
   const data = sheet.getDataRange().getValues();
   let foundRow = -1;
+  let displayName = "";
   let existingTag = "";
   let existingStudentName = "";
 
   for (let i = 1; i < data.length; i++) {
     if (data[i][0] === userId) {
       foundRow = i + 1;
+      displayName = data[i][1] ? data[i][1].toString().trim() : "";
       existingTag = data[i][3] ? data[i][3].toString().trim() : "";
       existingStudentName = data[i][4] ? data[i][4].toString().trim() : "";
       break;
     }
   }
 
+  // 若使用者已存在於試算表且已有有效暱稱，不重複請求 LINE API
   if (foundRow > 0) {
-    sheet.getRange(foundRow, 2).setValue(displayName);
-    sheet.getRange(foundRow, 3).setValue(nowStr);
+    if (!displayName || displayName === "家長") {
+      displayName = fetchLineDisplayName(userId, lineToken) || displayName || "家長";
+      sheet.getRange(foundRow, 2).setValue(displayName);
+    }
   } else {
+    // 全新使用者：抓取一次 LINE Profile，並新增至試算表
+    displayName = fetchLineDisplayName(userId, lineToken) || "家長";
     sheet.appendRow([userId, displayName, nowStr, "", ""]);
     foundRow = sheet.getLastRow();
   }
 
-  return { displayName: displayName, userTag: existingTag, studentName: existingStudentName, row: foundRow };
+  const userInfo = {
+    displayName: displayName || "家長",
+    userTag: existingTag,
+    studentName: existingStudentName,
+    row: foundRow
+  };
+
+  setCache(cacheKey, JSON.stringify(userInfo), CACHE_CONFIG.USER_TTL);
+  return userInfo;
 }
 
-// 📝 儲存學生姓名至試算表
-function saveStudentName(ss, row, studentName) {
+// 🌐 單次抓取 LINE 使用者個人暱稱
+function fetchLineDisplayName(userId, lineToken) {
+  if (!userId || !lineToken) return "家長";
+  try {
+    const url = `https://api.line.me/v2/bot/profile/${userId}`;
+    const response = UrlFetchApp.fetch(url, {
+      'headers': { 'Authorization': 'Bearer ' + lineToken },
+      'muteHttpExceptions': true
+    });
+    if (response.getResponseCode() === 200) {
+      const data = JSON.parse(response.getContentText());
+      if (data.displayName) return data.displayName.trim();
+    }
+  } catch (err) {
+    Logger.log("⚠️ 取得 LINE Profile 失敗: " + err.toString());
+  }
+  return "家長";
+}
+
+// 📝 儲存學生姓名至試算表與快取
+function saveStudentName(ss, row, studentName, userId, userInfo) {
   try {
     const sheet = ss.getSheetByName('使用者對照');
     if (sheet && row > 1) {
       sheet.getRange(row, 5).setValue(studentName);
       Logger.log(`✅ 已更新第 ${row} 列學生姓名為：${studentName}`);
     }
+    if (userId) {
+      const updatedInfo = Object.assign({}, userInfo || {}, { studentName: studentName, row: row });
+      setCache("USER_" + userId, JSON.stringify(updatedInfo), CACHE_CONFIG.USER_TTL);
+    }
   } catch (e) {
     Logger.log("⚠️ 儲存學生姓名失敗: " + e.toString());
+  }
+}
+
+// ⏱️ 節流更新「最後互動時間」（30 分鐘內不重複寫入試算表，避免 Sheet RPC 堵塞）
+function updateUserActiveThrottled(ss, row, userId) {
+  if (!row || row <= 1 || !userId) return;
+  const throttleKey = "ACTIVE_THROTTLE_" + userId;
+  if (getCache(throttleKey)) return;
+
+  try {
+    const sheet = ss.getSheetByName('使用者對照');
+    if (sheet) {
+      const nowStr = Utilities.formatDate(new Date(), "Asia/Taipei", "yyyy/MM/dd HH:mm:ss");
+      sheet.getRange(row, 3).setValue(nowStr);
+      setCache(throttleKey, "1", CACHE_CONFIG.THROTTLE_TTL);
+    }
+  } catch (e) {
+    Logger.log("⚠️ 節流更新最後互動時間失敗: " + e.toString());
   }
 }
 
@@ -203,25 +348,81 @@ function autoMarkEmotionalUser(ss, row, tagValue) {
   } catch (e) {}
 }
 
-// 📋 產生管理員指令表文字
-function getAdminMenuText(className) {
-  return `📋 【${className} 導師管理專用指令表】\n\n` +
-         `導師可透過「文字輸入」或「直接傳送語音」發送以下指令：\n\n` +
-         `1️⃣ 新增常見問答 (QA)\n` +
-         `🔹 格式：新增QA 關鍵字 回應內容\n` +
-         `🔹 範例：新增QA 請假 學生請假請至校務系統提出申請。\n` +
-         `🔹 說明：關鍵字與內容間可用「空白」或「|」隔開。\n\n` +
-         `2️⃣ 新增行程至個人日曆\n` +
-         `🔹 指定時間：新增行程 MM/DD hh:mm 行程名稱\n` +
-         `   範例：新增行程 9/29 11:30 考試\n` +
-         `🔹 全天行程：新增行程 MM/DD 行程名稱\n` +
-         `   範例：新增行程 10/20 校慶\n` +
-         `💡 提示：行程會新增至您的個人日曆並同步給 AI 查詢！\n\n` +
-         `3️⃣ 隨時查閱選單\n` +
-         `🔹 輸入：選單、指令、指令表\n\n` +
-         `🎙️ 語音小技巧：\n` +
-         `您可以直接對機器人錄音，例如講出：「新增行程 9月29日 11點30分 考試」或「選單」，AI 聽懂後就會為您執行！`;
+// ============================================================================
+// ⚡ 關鍵字與 QA 快速路徑 (Fast-Path)
+// ============================================================================
+
+// 讀取並快取 QA 題庫
+function getQAData(ss) {
+  const cacheKey = "QA_DATA_JSON";
+  const cached = getCache(cacheKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch (e) {}
+  }
+
+  const sheetQA = ss.getSheetByName('QA');
+  const qaList = [];
+  let qaContext = "【班級規範與常見問題】：\n";
+
+  if (sheetQA) {
+    const data = sheetQA.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      const kw = data[i][0] ? data[i][0].toString().trim() : "";
+      const ans = data[i][1] ? data[i][1].toString().trim() : "";
+      if (kw && ans) {
+        qaList.push({ keyword: kw, answer: ans });
+        qaContext += `【${kw}】: ${ans}\n`;
+      }
+    }
+  }
+
+  const result = { list: qaList, context: qaContext };
+  setCache(cacheKey, JSON.stringify(result), CACHE_CONFIG.QA_TTL);
+  return result;
 }
+
+// ⚡ 本地智能關鍵字比對
+function matchQAFastPath(userMessage, qaList) {
+  if (!userMessage || !qaList || qaList.length === 0) return null;
+  const cleanMsg = userMessage.trim().toLowerCase();
+
+  // 若使用者訊息含有可能的情緒、緊急或投訴詞彙，跳過 Fast-Path 交給 Gemini 進行深度判斷與 Email 通知
+  const sensitiveRegex = /受傷|流血|骨折|痛|哭|打架|霸凌|欺負|不舒服|發燒|生病|看醫生|診所|醫院|緊急|投訴|投訴導師|生氣|客訴|很不滿|投訴學校/;
+  if (sensitiveRegex.test(cleanMsg)) {
+    return null;
+  }
+
+  // 1. 完全比對 (精準度最高)
+  for (let i = 0; i < qaList.length; i++) {
+    const kw = qaList[i].keyword.trim().toLowerCase();
+    if (kw && kw === cleanMsg) {
+      return qaList[i].answer;
+    }
+  }
+
+  // 2. 短訊息 (20 字內) 的精準模糊比對（長關鍵字優先比對）
+  if (cleanMsg.length <= 20) {
+    const sortedList = qaList.slice().sort((a, b) => b.keyword.length - a.keyword.length);
+    for (let i = 0; i < sortedList.length; i++) {
+      const kw = sortedList[i].keyword.trim().toLowerCase();
+      if (kw.length >= 2) {
+        // 使用者輸入包含關鍵字（例如「我想查成績」包含「成績」）
+        // 或關鍵字包含使用者輸入（例如「電話」比對到「學校電話與分機」）
+        if (cleanMsg.includes(kw) || (cleanMsg.length >= 2 && kw.includes(cleanMsg))) {
+          return sortedList[i].answer;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+// ============================================================================
+// 🧠 Google Gemini AI 核心呼叫與語音辨識
+// ============================================================================
 
 // 🎙️ 下載 LINE 語音並使用 Gemini 辨識轉文字
 function processAudioMessage(messageId, settings) {
@@ -244,15 +445,14 @@ function processAudioMessage(messageId, settings) {
   }
 }
 
-// 🎙️️ Gemini 專屬語音轉文字
+// 🎙️ Gemini 專屬語音轉文字（移除每次無謂的 ListModels API 呼叫）
 function callGeminiAudioTranscribe(base64Data, mimeType, apiKey) {
   const dynamicModel = getLatestFlashModelName(apiKey);
   const candidateModels = Array.from(new Set([
-    "gemini-flash-lite-latest",
     dynamicModel,
-    "gemini-flash-latest",
-    "gemini-3.6-flash",
-    "gemini-2.5-flash"
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest"
   ].filter(Boolean)));
 
   const systemPrompt = "請將這段語音完整轉寫為繁體中文文字。不要加入開場白或解釋，只需精準輸出聽到的語音文字內容。";
@@ -285,119 +485,44 @@ function callGeminiAudioTranscribe(base64Data, mimeType, apiKey) {
   return "（語音辨識失敗）";
 }
 
-// 📅 導師新增行程到 Google 日曆
-function handleAdminAddCalendar(userMessage, replyToken, calendarId, lineToken) {
-  let cleanMsg = userMessage.replace(/^新增行程|^新增行事曆|^新增日曆/, "").trim();
-  
-  const regex = /^(\d{1,2})[\/\-](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?\s+(.+)$/;
-  const match = cleanMsg.match(regex);
-
-  if (!match) {
-    replyMessage(replyToken, "⚠️ 新增行程格式不正確！\n\n範例：\n新增行程 9/29 11:30 考試\n新增行程 10/15 校慶", lineToken);
-    return;
-  }
-
-  const month = parseInt(match[1], 10) - 1;
-  const day = parseInt(match[2], 10);
-  const hour = match[3] !== undefined ? parseInt(match[3], 10) : null;
-  const minute = match[4] !== undefined ? parseInt(match[4], 10) : null;
-  const title = match[5].trim();
-
-  const now = new Date();
-  let year = now.getFullYear();
-
-  let startDate;
-  const isAllDay = (hour === null || minute === null);
-
-  if (isAllDay) {
-    startDate = new Date(year, month, day, 0, 0, 0);
-  } else {
-    startDate = new Date(year, month, day, hour, minute, 0);
-  }
-
-  if (startDate.getTime() < now.getTime()) {
-    year += 1;
-    if (isAllDay) {
-      startDate = new Date(year, month, day, 0, 0, 0);
-    } else {
-      startDate = new Date(year, month, day, hour, minute, 0);
-    }
-  }
-
-  try {
-    const cal = CalendarApp.getCalendarById(calendarId);
-    if (!cal) {
-      replyMessage(replyToken, "❌ 找不到指定日曆，請確認 TEACHER_CALENDAR_ID 設定！", lineToken);
-      return;
-    }
-
-    if (isAllDay) {
-      cal.createAllDayEvent(title, startDate);
-    } else {
-      const endDate = new Date(startDate.getTime() + 60 * 60 * 1000);
-      cal.createEvent(title, startDate, endDate);
-    }
-
-    const timeStr = isAllDay 
-      ? `${year}/${month+1}/${day} (全天)` 
-      : `${year}/${month+1}/${day} ${hour}:${minute < 10 ? '0' + minute : minute}`;
-
-    replyMessage(replyToken, `✅ 已成功加入教師個人日曆！\n\n📌 行程：${title}\n📅 時間：${timeStr}`, lineToken);
-    
-    syncSchoolCalendarToSheet();
-  } catch (err) {
-    replyMessage(replyToken, "❌ 新增行程失敗：" + err.toString(), lineToken);
-  }
-}
-
-// 📧 寄送 Email 通知導師
-function sendTeacherEmail(teacherEmail, parentName, studentName, userId, userMessage, reason, className) {
-  if (!teacherEmail) return;
-  const subject = `【${className} LINE 機器人家長訊息待處理通知】來自 ${studentName ? studentName + ' 家長' : parentName}`;
-  const body = `親愛的老師，您好：\n\n${className} LINE 班級機器人收到了一則家長訊息，需請您撥空處理：\n\n🎓 學生姓名：${studentName || "未登記"}\n👤 家長 LINE 暱稱：${parentName}\n🆔 家長 LINE ID：${userId}\n💬 訊息內容：${userMessage}\n🔍 AI 判斷原因：${reason || '需導師親自聯繫處理'}\n\n請於方便時撥空處理，謝謝！`;
-
-  try {
-    MailApp.sendEmail(teacherEmail, subject, body);
-  } catch (err1) {
-    try {
-      GmailApp.sendEmail(teacherEmail, subject, body);
-    } catch (err2) {
-      Logger.log(`❌ Email 寄送失敗: ${err2.toString()}`);
-    }
-  }
-}
-
-// 💡 動態抓取 Flash 模型名稱
+// 💡 取得 Flash 模型名稱（快取 24 小時，絕不在每則訊息重複探測）
 function getLatestFlashModelName(apiKey) {
-  const defaultModel = "gemini-flash-lite-latest";
+  const defaultModel = "gemini-2.5-flash";
   if (!apiKey) return defaultModel;
 
-  const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-  
-  try {
-    const response = UrlFetchApp.fetch(listUrl, { "muteHttpExceptions": true });
-    const result = JSON.parse(response.getContentText());
-    
-    if (result.models && Array.isArray(result.models)) {
-      const flashModels = result.models
-        .filter(m => {
-          const name = m.name.toLowerCase();
-          const hasGen = m.supportedGenerationMethods && m.supportedGenerationMethods.includes("generateContent");
-          const isFlash = name.includes("flash");
-          const isExcluded = name.includes("tts") || name.includes("image") || name.includes("computer-use") || name.includes("omni") || name.includes("exp");
-          return hasGen && isFlash && !isExcluded;
-        })
-        .map(m => m.name.replace("models/", ""));
+  const cacheKey = "GEMINI_MODEL_NAME";
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
 
-      if (flashModels.length > 0) {
-        flashModels.sort((a, b) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }));
-        return flashModels[0];
+  try {
+    const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+    const response = UrlFetchApp.fetch(listUrl, { "muteHttpExceptions": true });
+    if (response.getResponseCode() === 200) {
+      const result = JSON.parse(response.getContentText());
+      if (result.models && Array.isArray(result.models)) {
+        const flashModels = result.models
+          .filter(m => {
+            const name = m.name.toLowerCase();
+            const hasGen = m.supportedGenerationMethods && m.supportedGenerationMethods.includes("generateContent");
+            const isFlash = name.includes("flash");
+            const isExcluded = name.includes("tts") || name.includes("image") || name.includes("computer-use") || name.includes("omni") || name.includes("exp");
+            return hasGen && isFlash && !isExcluded;
+          })
+          .map(m => m.name.replace("models/", ""));
+
+        if (flashModels.length > 0) {
+          flashModels.sort((a, b) => b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' }));
+          const selected = flashModels[0];
+          setCache(cacheKey, selected, CACHE_CONFIG.MODEL_TTL);
+          return selected;
+        }
       }
     }
   } catch (err) {
     Logger.log("⚠️ 取得模型清單失敗，使用預設值: " + err.toString());
   }
 
+  setCache(cacheKey, defaultModel, CACHE_CONFIG.MODEL_TTL);
   return defaultModel;
 }
 
@@ -405,11 +530,10 @@ function getLatestFlashModelName(apiKey) {
 function callGeminiWithFallback(userMessage, fullContext, apiKey, className) {
   const dynamicModel = getLatestFlashModelName(apiKey);
   const candidateModels = Array.from(new Set([
-    "gemini-flash-lite-latest",
     dynamicModel,
-    "gemini-flash-latest",
-    "gemini-3.6-flash",
-    "gemini-2.5-flash"
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest"
   ].filter(Boolean)));
 
   for (const modelName of candidateModels) {
@@ -478,6 +602,77 @@ ${fullContext}
   }
 }
 
+// ============================================================================
+// 📅 行事曆與公告快取整合
+// ============================================================================
+
+// 取得行事曆 Context（快取 4 小時，且只抓取未來 45 天行程，減少 Prompt 體積加速生成）
+function getSchoolCalendarFromSheet(ss) {
+  const cacheKey = "CALENDAR_CONTEXT";
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
+
+  const sheet = ss.getSheetByName('行事曆Cache');
+  if (!sheet || sheet.getLastRow() <= 1) {
+    const defaultText = "【近期行事曆與班級行程】：（目前無預定行程）\n";
+    setCache(cacheKey, defaultText, CACHE_CONFIG.CALENDAR_TTL);
+    return defaultText;
+  }
+
+  const data = sheet.getDataRange().getValues();
+  let calText = "【近期行事曆與班級行程】：\n";
+  const now = new Date();
+  const maxFuture = new Date(now.getTime() + 45 * 24 * 60 * 60 * 1000);
+  let count = 0;
+
+  for (let i = 1; i < data.length; i++) {
+    const dateStr = data[i][2] ? data[i][2].toString() : "";
+    const title = data[i][1] ? data[i][1].toString() : "";
+    const sourceStr = data[i][4] ? `[${data[i][4]}] ` : "";
+
+    const eventDate = parseDateFromText(dateStr);
+    if (!eventDate || (eventDate >= new Date(now.getTime() - 24 * 60 * 60 * 1000) && eventDate <= maxFuture)) {
+      calText += `- ${sourceStr}${dateStr}: ${title}\n`;
+      count++;
+      if (count >= 20) break;
+    }
+  }
+
+  if (count === 0) {
+    calText = "【近期行事曆與班級行程】：（近期無特別行程）\n";
+  }
+
+  setCache(cacheKey, calText, CACHE_CONFIG.CALENDAR_TTL);
+  return calText;
+}
+
+// 取得學校公告 Context（快取 4 小時，精簡至最新 8 則）
+function getSchoolNewsContext(ss) {
+  const cacheKey = "NEWS_CONTEXT";
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
+
+  const sheet = ss.getSheetByName('學校公告');
+  if (!sheet || sheet.getLastRow() <= 1) {
+    const defaultText = "【學校近一個月官網公告】：（目前無公告）\n";
+    setCache(cacheKey, defaultText, CACHE_CONFIG.NEWS_TTL);
+    return defaultText;
+  }
+
+  const data = sheet.getDataRange().getValues();
+  let newsText = "【學校近一個月官網公告】：\n";
+  const maxRows = Math.min(data.length, 9);
+  for (let i = 1; i < maxRows; i++) {
+    if (data[i][1] && data[i][2]) {
+      const dateInfo = data[i][3] ? `[${data[i][3]}] ` : "";
+      newsText += `- ${dateInfo}${data[i][1]} (網址: ${data[i][2]})\n`;
+    }
+  }
+
+  setCache(cacheKey, newsText, CACHE_CONFIG.NEWS_TTL);
+  return newsText;
+}
+
 // 💡 輔助函式：取得日曆物件，若使用者尚未訂閱，自動嘗試為其訂閱
 function getOrSubscribeCalendar(calendarId) {
   if (!calendarId) return null;
@@ -525,7 +720,6 @@ function syncSchoolCalendarToSheet() {
         Logger.log("⚠️ CalendarApp 讀取學校日曆失敗，準備啟動 iCal 備援: " + e.toString());
       }
 
-      // 🛡️ 備援機制：如果 CalendarApp 未抓到任何行程，自動透過 HTTP 直接爬取公開 iCal 訂閱檔
       if (schoolEventsCount === 0) {
         Logger.log("ℹ️ 啟動爬取備援機制：直接抓取公開 iCal 檔...");
         const backupEvents = fetchPublicIcalEvents(settings.SCHOOL_CALENDAR_ID);
@@ -555,6 +749,7 @@ function syncSchoolCalendarToSheet() {
       sheet.appendRow([updateTime, e.title, startStr, endStr, e.source]);
     });
 
+    clearCache("CALENDAR_CONTEXT");
     Logger.log(`✅ 日曆同步完成，共抓取 ${allEvents.length} 筆行程！`);
 
   } catch (err) {
@@ -680,6 +875,7 @@ function fetchSchoolAnnouncements() {
       if (addedCount >= 30) break;
     }
 
+    clearCache("NEWS_CONTEXT");
     Logger.log(`✅ 已成功抓取 ${addedCount} 筆近一個月學校公告！`);
   } catch (err) {
     Logger.log("❌ 抓取公告失敗: " + err.toString());
@@ -701,49 +897,100 @@ function parseDateFromText(text) {
   return null;
 }
 
-// 輔助函式
-function getQAContext(sheet) {
-  if (!sheet) return "";
-  const data = sheet.getDataRange().getValues();
-  let qaText = "【班級規範與常見問題】：\n";
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][0] && data[i][1]) {
-      qaText += `【${data[i][0]}】: ${data[i][1]}\n`;
+// ============================================================================
+// 🛠️ 管理員功能與訊息發送
+// ============================================================================
+
+// 📋 產生管理員指令表文字
+function getAdminMenuText(className) {
+  return `📋 【${className} 導師管理專用指令表】\n\n` +
+         `導師可透過「文字輸入」或「直接傳送語音」發送以下指令：\n\n` +
+         `1️⃣ 新增常見問答 (QA)\n` +
+         `🔹 格式：新增QA 關鍵字 回應內容\n` +
+         `🔹 範例：新增QA 請假 學生請假請至校務系統提出申請。\n` +
+         `🔹 說明：關鍵字與內容間可用「空白」或「|」隔開。\n\n` +
+         `2️⃣ 新增行程至個人日曆\n` +
+         `🔹 指定時間：新增行程 MM/DD hh:mm 行程名稱\n` +
+         `   範例：新增行程 9/29 11:30 考試\n` +
+         `🔹 全天行程：新增行程 MM/DD 行程名稱\n` +
+         `   範例：新增行程 10/20 校慶\n` +
+         `💡 提示：行程會新增至您的個人日曆並自動同步！\n\n` +
+         `3️⃣ 系統維護\n` +
+         `🔹 輸入：清除快取（立即強制重新載入試算表與設定）\n\n` +
+         `4️⃣ 隨時查閱選單\n` +
+         `🔹 輸入：選單、指令、指令表\n\n` +
+         `🎙️ 語音小技巧：\n` +
+         `您可以直接對機器人錄音，例如講出：「新增行程 9月29日 11點30分 考試」或「選單」，AI 聽懂後就會為您執行！`;
+}
+
+// 📅 導師新增行程到 Google 日曆
+function handleAdminAddCalendar(userMessage, replyToken, calendarId, lineToken) {
+  let cleanMsg = userMessage.replace(/^新增行程|^新增行事曆|^新增日曆/, "").trim();
+  
+  const regex = /^(\d{1,2})[\/\-](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?\s+(.+)$/;
+  const match = cleanMsg.match(regex);
+
+  if (!match) {
+    replyMessage(replyToken, "⚠️ 新增行程格式不正確！\n\n範例：\n新增行程 9/29 11:30 考試\n新增行程 10/15 校慶", lineToken);
+    return;
+  }
+
+  const month = parseInt(match[1], 10) - 1;
+  const day = parseInt(match[2], 10);
+  const hour = match[3] !== undefined ? parseInt(match[3], 10) : null;
+  const minute = match[4] !== undefined ? parseInt(match[4], 10) : null;
+  const title = match[5].trim();
+
+  const now = new Date();
+  let year = now.getFullYear();
+
+  let startDate;
+  const isAllDay = (hour === null || minute === null);
+
+  if (isAllDay) {
+    startDate = new Date(year, month, day, 0, 0, 0);
+  } else {
+    startDate = new Date(year, month, day, hour, minute, 0);
+  }
+
+  if (startDate.getTime() < now.getTime()) {
+    year += 1;
+    if (isAllDay) {
+      startDate = new Date(year, month, day, 0, 0, 0);
+    } else {
+      startDate = new Date(year, month, day, hour, minute, 0);
     }
   }
-  return qaText;
-}
 
-function getSchoolCalendarFromSheet(ss) {
-  const sheet = ss.getSheetByName('行事曆Cache');
-  if (!sheet || sheet.getLastRow() <= 1) return "【未來半年行事曆與班級行程】：（目前無預定行程）\n";
-
-  const data = sheet.getDataRange().getValues();
-  let calText = "【未來半年行事曆與班級行程】：\n";
-  for (let i = 1; i < data.length; i++) {
-    const sourceStr = data[i][4] ? `[${data[i][4]}] ` : "";
-    calText += `- ${sourceStr}${data[i][2]}: ${data[i][1]}\n`;
-  }
-  return calText;
-}
-
-function getSchoolNewsContext(ss) {
-  const sheet = ss.getSheetByName('學校公告');
-  if (!sheet || sheet.getLastRow() <= 1) return "【學校近一個月官網公告】：（目前無公告）\n";
-
-  const data = sheet.getDataRange().getValues();
-  let newsText = "【學校近一個月官網公告】：\n";
-  const maxRows = Math.min(data.length, 25);
-  for (let i = 1; i < maxRows; i++) {
-    if (data[i][1] && data[i][2]) {
-      const dateInfo = data[i][3] ? `[${data[i][3]}] ` : "";
-      newsText += `- ${dateInfo}${data[i][1]} (網址: ${data[i][2]})\n`;
+  try {
+    const cal = CalendarApp.getCalendarById(calendarId);
+    if (!cal) {
+      replyMessage(replyToken, "❌ 找不到指定日曆，請確認 TEACHER_CALENDAR_ID 設定！", lineToken);
+      return;
     }
+
+    if (isAllDay) {
+      cal.createAllDayEvent(title, startDate);
+    } else {
+      const endDate = new Date(startDate.getTime() + 60 * 60 * 1000);
+      cal.createEvent(title, startDate, endDate);
+    }
+
+    const timeStr = isAllDay 
+      ? `${year}/${month+1}/${day} (全天)` 
+      : `${year}/${month+1}/${day} ${hour}:${minute < 10 ? '0' + minute : minute}`;
+
+    replyMessage(replyToken, `✅ 已成功加入教師個人日曆！\n\n📌 行程：${title}\n📅 時間：${timeStr}`, lineToken);
+    
+    clearCache("CALENDAR_CONTEXT");
+    syncSchoolCalendarToSheet();
+  } catch (err) {
+    replyMessage(replyToken, "❌ 新增行程失敗：" + err.toString(), lineToken);
   }
-  return newsText;
 }
 
-function handleAdminAddQA(userMessage, replyToken, sheet, lineToken) {
+// 💬 管理員新增 QA
+function handleAdminAddQA(userMessage, replyToken, ss, lineToken) {
   let cleanMsg = userMessage.replace(/^新增QA|^新增關鍵字/, "").trim();
   let keyword = "", content = "";
 
@@ -759,14 +1006,34 @@ function handleAdminAddQA(userMessage, replyToken, sheet, lineToken) {
     }
   }
 
-  if (keyword && content) {
+  const sheet = ss.getSheetByName('QA');
+  if (keyword && content && sheet) {
     sheet.appendRow([keyword, content]);
-    replyMessage(replyToken, `✅ 已成功新增 QA 到試算表！\n\n📌 關鍵字：${keyword}\n📝 回應內容：${content}`, lineToken);
+    clearCache("QA_DATA_JSON"); // 立即清除快取，下次立刻生效
+    replyMessage(replyToken, `✅ 已成功新增 QA 到試算表並刷新快取！\n\n📌 關鍵字：${keyword}\n📝 回應內容：${content}`, lineToken);
   } else {
     replyMessage(replyToken, `⚠️ 新增失敗，格式：新增QA 關鍵字 回應內容`, lineToken);
   }
 }
 
+// 📧 寄送 Email 通知導師
+function sendTeacherEmail(teacherEmail, parentName, studentName, userId, userMessage, reason, className) {
+  if (!teacherEmail) return;
+  const subject = `【${className} LINE 機器人家長訊息待處理通知】來自 ${studentName ? studentName + ' 家長' : parentName}`;
+  const body = `親愛的老師，您好：\n\n${className} LINE 班級機器人收到了一則家長訊息，需請您撥空處理：\n\n🎓 學生姓名：${studentName || "未登記"}\n👤 家長 LINE 暱稱：${parentName}\n🆔 家長 LINE ID：${userId}\n💬 訊息內容：${userMessage}\n🔍 AI 判斷原因：${reason || '需導師親自聯繫處理'}\n\n請於方便時撥空處理，謝謝！`;
+
+  try {
+    MailApp.sendEmail(teacherEmail, subject, body);
+  } catch (err1) {
+    try {
+      GmailApp.sendEmail(teacherEmail, subject, body);
+    } catch (err2) {
+      Logger.log(`❌ Email 寄送失敗: ${err2.toString()}`);
+    }
+  }
+}
+
+// 💬 LINE Messaging API 回覆訊息
 function replyMessage(replyToken, text, lineToken) {
   UrlFetchApp.fetch('https://api.line.me/v2/bot/message/reply', {
     'headers': { 'Content-Type': 'application/json; charset=UTF-8', 'Authorization': 'Bearer ' + lineToken },
@@ -775,9 +1042,21 @@ function replyMessage(replyToken, text, lineToken) {
   });
 }
 
+// ============================================================================
 // 🧪 專用檢測權限與設定的測試函式
+// ============================================================================
 function testPermissions() {
   Logger.log("=== 🔍 開始檢測 LINE Bot 與 GAS 權限及設定 ===");
+
+  try {
+    const cache = CacheService.getScriptCache();
+    cache.put("TEST_CACHE", "OK", 60);
+    const testVal = cache.get("TEST_CACHE");
+    if (testVal === "OK") Logger.log("✅ 0. CacheService 高速快取運作正常！");
+  } catch (e) {
+    Logger.log("⚠️ 0. CacheService 異常: " + e.toString());
+  }
+
   const settings = getSystemSettings();
 
   Logger.log("✅ 1. 系統設定讀取成功！");

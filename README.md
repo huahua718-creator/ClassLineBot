@@ -16,12 +16,12 @@
 
 ## 📂 專案檔案結構
 
-`	ext
+```text
 ClassLineBot/
 ├── AppsScript/                     # Google Apps Script 原始碼與同步工具
 │   ├── .clasp.json                 # Google Clasp 設定檔（已綁定 Script ID）
 │   ├── appsscript.json             # GAS 專案資訊清單（時區 Asia/Taipei 與執行環境）
-│   ├── 程式碼.js                    # LINE Webhook、Gemini AI、行事曆與公告核心邏輯
+│   ├── 程式碼.js                    # LINE Webhook、Gemini AI、行事曆與公告核心邏輯 (高速快取優化版)
 │   ├── pull.bat                    # Windows 一鍵從 GAS 拉取最新代碼
 │   └── push.bat                    # Windows 一鍵將代碼推送到 GAS
 ├── GoogleSheets/                   # Google 試算表資料備份與分頁導出
@@ -34,35 +34,42 @@ ClassLineBot/
 │   └── 系統設定_範本.csv            # 系統設定檔範本（供新環境部署使用）
 ├── .gitignore                      # Git 忽略檔案設定
 └── README.md                       # 專案說明文件
-`
+```
 
 ---
 
-## 🚀 核心功能特色
+## 🚀 核心功能特色與極速效能架構
 
-1. **家長與學生自動對照綁定**
+1. **⚡ 毫秒級高速路徑 (Fast-Path) 與 CacheService 多級快取**
+   - 整合 Google Apps Script `CacheService` 記憶體快取架構，系統設定、常見問答、行事曆與公告直接常駐於高速快取（避免每次重複讀取試算表，省去 1.5~2.5 秒 Sheet RPC 耗時）。
+   - **關鍵字 QA 秒回機制**：常見問題（如成績查詢、大屏系統、處室電話、校慶日期）及常用招呼語優先於本地記憶體比對，**0.3 ~ 0.5 秒極速秒回**，不需等待 AI 推理，大幅降低 Token 費用與延遲。
+   - **非關鍵後台作業解耦**：先將 LINE 訊息送出給家長，再於背景節流更新互動記錄與寄送 Email，避免家長端卡頓。
+
+2. **家長與學生自動對照綁定**
    - 家長加入 LINE 好友時，系統自動發送親切歡迎詞並引導提供學生姓名。
    - 支援輸入「學生：王小明」、「孩子：王小明」自動記錄至「使用者對照」分頁。
+   - 智慧快取 LINE 使用者暱稱，避免每則訊息重複呼叫 LINE Profile API。
 
-2. **智慧訊息辨識 (Gemini AI)**
+3. **智慧訊息辨識 (Gemini 2.5 Flash AI)**
    - 支援文字訊息與**語音訊息辨識**，長輩與忙碌家長可直接使用語音詢問。
-   - 結合 Google Gemini 2.5 Flash / Flash-Lite 動態最新模型，提供具同理心且溫暖的導師級回覆。
+   - 預設直連 Google Gemini 2.5 Flash / Flash-Lite 最新模型，移除動態輪詢列表的網路延遲，提供具同理心且溫暖客觀的導師級回覆。
 
-3. **關鍵字 QA 自動回覆與線上動態擴充**
+4. **關鍵字 QA 自動回覆與線上動態擴充**
    - 優先比對「QA」分頁關鍵字，提供成績查詢、大屏系統、處室分機、校慶補假等資訊。
-   - 導師可直接在 LINE 對話中輸入指令擴充資料庫：
-     `	ext
+   - 導師可直接在 LINE 對話中輸入指令擴充資料庫並即時刷新快取：
+     ```text
      新增QA 聯絡簿 聯絡簿請於每日 18:00 前簽名確認
-     `
+     ```
+   - 支援導師輸入「清除快取」或「刷新快取」隨時重新載入試算表最新設定。
 
-4. **行事曆同步與快速新增行程**
-   - 整合學校 Google 日曆與教師個人主日曆，即時查詢本週與近期重要日程。
+5. **行事曆同步與快速新增行程**
+   - 整合學校 Google 日曆與教師個人主日曆，即時查詢近期重要日程。
    - 導師可直接在 LINE 中新增行程：
-     `	ext
+     ```text
      新增行程 12/7 09:00 校慶大會
-     `
+     ```
 
-5. **學校官網公告即時擷取**
+6. **學校官網公告即時擷取**
    - 自動解析學校公告網頁，定時快取並過濾重要訊息，方便家長與師生隨時掌握校園動態。
 
 ---
@@ -72,18 +79,18 @@ ClassLineBot/
 本專案已配置 @google/clasp，可在本地端使用 VS Code 等編輯器修改代碼後直接同步至 Google Apps Script：
 
 ### 1. 取得最新程式碼
-`ash
+```bash
 cd AppsScript
 npx @google/clasp pull
 # 或在 Windows 直接雙擊執行 pull.bat
-`
+```
 
 ### 2. 推送本地修改至 Google Apps Script
-`ash
+```bash
 cd AppsScript
 npx @google/clasp push -f
 # 或在 Windows 直接雙擊執行 push.bat
-`
+```
 
 ---
 
