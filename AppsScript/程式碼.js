@@ -45,6 +45,7 @@ function clearAllCaches() {
     cache.remove("CALENDAR_CONTEXT");
     cache.remove("NEWS_CONTEXT");
     cache.remove("GEMINI_MODEL_NAME");
+    cache.remove("GEMINI_MODEL_NAME_V3");
     Logger.log("🧹 所有全域快取已清除！");
   } catch (e) {}
 }
@@ -445,14 +446,15 @@ function processAudioMessage(messageId, settings) {
   }
 }
 
-// 🎙️ Gemini 專屬語音轉文字（移除每次無謂的 ListModels API 呼叫）
+// 🎙️ Gemini 專屬語音轉文字（優先使用最新 Gemini 3.6 Flash）
 function callGeminiAudioTranscribe(base64Data, mimeType, apiKey) {
   const dynamicModel = getLatestFlashModelName(apiKey);
   const candidateModels = Array.from(new Set([
+    "gemini-3.6-flash",
     dynamicModel,
+    "gemini-flash-latest",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-flash-latest"
+    "gemini-2.5-flash-lite"
   ].filter(Boolean)));
 
   const systemPrompt = "請將這段語音完整轉寫為繁體中文文字。不要加入開場白或解釋，只需精準輸出聽到的語音文字內容。";
@@ -485,12 +487,12 @@ function callGeminiAudioTranscribe(base64Data, mimeType, apiKey) {
   return "（語音辨識失敗）";
 }
 
-// 💡 取得 Flash 模型名稱（快取 24 小時，絕不在每則訊息重複探測）
+// 💡 取得 Flash 模型名稱（優先預設最新 gemini-3.6-flash，快取 24 小時，絕不在每則訊息重複探測）
 function getLatestFlashModelName(apiKey) {
-  const defaultModel = "gemini-2.5-flash";
+  const defaultModel = "gemini-3.6-flash";
   if (!apiKey) return defaultModel;
 
-  const cacheKey = "GEMINI_MODEL_NAME";
+  const cacheKey = "GEMINI_MODEL_NAME_V3";
   const cached = getCache(cacheKey);
   if (cached) return cached;
 
@@ -526,14 +528,15 @@ function getLatestFlashModelName(apiKey) {
   return defaultModel;
 }
 
-// 💡 整合後的模型呼叫順序
+// 💡 整合後的模型呼叫順序（以 Gemini 3.6 Flash 為第一順位）
 function callGeminiWithFallback(userMessage, fullContext, apiKey, className) {
   const dynamicModel = getLatestFlashModelName(apiKey);
   const candidateModels = Array.from(new Set([
+    "gemini-3.6-flash",
     dynamicModel,
+    "gemini-flash-latest",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-flash-latest"
+    "gemini-2.5-flash-lite"
   ].filter(Boolean)));
 
   for (const modelName of candidateModels) {
